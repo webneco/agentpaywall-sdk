@@ -1,0 +1,76 @@
+{
+  "name": "@agentpaywall/sdk",
+  "version": "0.1.0",
+  "description": "Drop-in USDC micropayment middleware for APIs, settled on Solana.",
+  "license": "MIT",
+  "author": "Webneco",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/webneco/agentpaywall-sdk.git"
+  },
+  "homepage": "https://github.com/webneco/agentpaywall-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/webneco/agentpaywall-sdk/issues"
+  },
+  "keywords": [
+    "solana",
+    "usdc",
+    "micropayments",
+    "api",
+    "paywall",
+    "middleware",
+    "express",
+    "nextjs",
+    "ai-agents",
+    "web3"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./nextjs": {
+      "types": "./dist/nextjs.d.ts",
+      "import": "./dist/nextjs.mjs",
+      "require": "./dist/nextjs.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "type-check": "tsc --noEmit",
+    "clean": "rm -rf dist .turbo node_modules"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.12.7",
+    "eslint": "^8.57.0",
+    "tsup": "^8.1.0",
+    "typescript": "^5.4.5",
+    "vitest": "^2.1.8"
+  },
+  "peerDependencies": {
+    "@solana/spl-token": ">=0.3.0",
+    "@solana/web3.js": ">=1.0.0",
+    "express": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false
+}
