@@ -1,4 +1,4 @@
-<![CDATA[# @agentpaywall/sdk
+# @agentpaywall/sdk
 
 [![npm version](https://img.shields.io/npm/v/@agentpaywall/sdk.svg)](https://www.npmjs.com/package/@agentpaywall/sdk)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
@@ -185,4 +185,3 @@ Track earnings, API calls, and transactions in real time at [agentpaywall.vercel
 ## License
 
 [MIT](LICENSE)
-]]>
