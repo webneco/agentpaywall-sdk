@@ -2,14 +2,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 type MockState = {
   parsedTransaction: unknown;
-  accountInfoByPubkey: Map<string, unknown>;
   transactionError: Error | null;
   transactionDelayMs: number;
 };
 
 const mockState: MockState = {
   parsedTransaction: null,
-  accountInfoByPubkey: new Map<string, unknown>(),
   transactionError: null,
   transactionDelayMs: 0,
 };
@@ -22,7 +20,6 @@ vi.mock('@solana/web3.js', () => {
       if (!value || typeof value !== 'string' || value.length < 8) {
         throw new Error('Invalid public key');
       }
-
       this.value = value;
     }
 
@@ -47,17 +44,6 @@ vi.mock('@solana/web3.js', () => {
 
       return mockState.parsedTransaction;
     }
-
-    async getParsedAccountInfo(publicKey: { toBase58?: () => string }) {
-      const address =
-        typeof publicKey?.toBase58 === 'function'
-          ? publicKey.toBase58()
-          : String(publicKey);
-
-      return {
-        value: mockState.accountInfoByPubkey.get(address) ?? null,
-      };
-    }
   }
 
   return {
@@ -70,54 +56,65 @@ import { verifyUSDCPayment } from '../src/verify';
 
 const EXPECTED_RECIPIENT = 'RecipientWallet1111111111111111111111111';
 const EXPECTED_USDC_MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
+const OTHER_MINT = 'OtherMint1111111111111111111111111111111111111';
+const SENDER_WALLET = 'SenderWallet22222222222222222222222222222222';
 
-function tokenAccountInfo(owner: string, mint: string): unknown {
+type TokenBalanceEntry = {
+  accountIndex: number;
+  mint: string;
+  owner?: string;
+  programId?: string;
+  uiTokenAmount: {
+    amount: string;
+    decimals: number;
+    uiAmount: number;
+    uiAmountString: string;
+  };
+};
+
+function tokenBalance(
+  accountIndex: number,
+  owner: string,
+  mint: string,
+  amountRaw: string,
+): TokenBalanceEntry {
+  const decimals = 6;
+  const uiAmount = Number(BigInt(amountRaw)) / 10 ** decimals;
   return {
-    data: {
-      parsed: {
-        info: {
-          owner,
-          mint,
-        },
-      },
+    accountIndex,
+    mint,
+    owner,
+    programId: 'spl-token',
+    uiTokenAmount: {
+      amount: amountRaw,
+      decimals,
+      uiAmount,
+      uiAmountString: String(uiAmount),
     },
   };
 }
 
-function parsedTransferCheckedInstruction(params: {
-  amountRaw: string;
-  destinationTokenAccount: string;
-  sourceTokenAccount?: string;
-  authority?: string;
-  mint?: string;
-}): unknown {
-  return {
-    program: 'spl-token',
-    parsed: {
-      type: 'transferChecked',
-      info: {
-        amount: params.amountRaw,
-        tokenAmount: {
-          amount: params.amountRaw,
-          decimals: 6,
-        },
-        destination: params.destinationTokenAccount,
-        source: params.sourceTokenAccount,
-        authority: params.authority,
-        mint: params.mint,
-      },
-    },
-  };
-}
+type MockTxOptions = {
+  preTokenBalances?: TokenBalanceEntry[];
+  postTokenBalances?: TokenBalanceEntry[];
+  err?: unknown;
+  blockTime?: number | null;
+};
 
-function mockParsedTransaction(instructions: unknown[]): unknown {
+function mockTx(opts: MockTxOptions = {}): unknown {
+  const blockTime =
+    'blockTime' in opts ? opts.blockTime : Math.floor(Date.now() / 1000);
   return {
     meta: {
+      err: opts.err ?? null,
+      preTokenBalances: opts.preTokenBalances ?? [],
+      postTokenBalances: opts.postTokenBalances ?? [],
       innerInstructions: [],
     },
+    blockTime,
     transaction: {
       message: {
-        instructions,
+        instructions: [],
       },
     },
   };
@@ -126,13 +123,12 @@ function mockParsedTransaction(instructions: unknown[]): unknown {
 describe('verifyUSDCPayment', () => {
   beforeEach(() => {
     mockState.parsedTransaction = null;
-    mockState.accountInfoByPubkey = new Map<string, unknown>();
     mockState.transactionError = null;
     mockState.transactionDelayMs = 0;
     vi.useRealTimers();
   });
 
-  it('returns invalid when transaction signature is missing', async () => {
+  it('rejects a missing signature with MISSING_SIGNATURE', async () => {
     const result = await verifyUSDCPayment({
       txSignature: '',
       expectedRecipient: EXPECTED_RECIPIENT,
@@ -142,10 +138,35 @@ describe('verifyUSDCPayment', () => {
     });
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('Missing transaction signature');
+    expect(result.errorCode).toBe('MISSING_SIGNATURE');
   });
 
-  it('returns invalid when transaction is not found', async () => {
+  it('rejects non-positive amounts with INVALID_REQUEST', async () => {
+    const result = await verifyUSDCPayment({
+      txSignature: 'Sig11111111111111111111111111111111111111111',
+      expectedRecipient: EXPECTED_RECIPIENT,
+      expectedAmountUsdc: 0,
+      rpcUrl: 'https://api.devnet.solana.com',
+      usdcMintAddress: EXPECTED_USDC_MINT,
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errorCode).toBe('INVALID_REQUEST');
+  });
+
+  it('requires explicit usdcMintAddress for unknown RPC hosts', async () => {
+    const result = await verifyUSDCPayment({
+      txSignature: 'Sig22222222222222222222222222222222222222222',
+      expectedRecipient: EXPECTED_RECIPIENT,
+      expectedAmountUsdc: 0.001,
+      rpcUrl: 'https://mainnet-something-custom.example.com',
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errorCode).toBe('INVALID_REQUEST');
+  });
+
+  it('returns TX_NOT_FOUND when the RPC returns null', async () => {
     mockState.parsedTransaction = null;
 
     const result = await verifyUSDCPayment({
@@ -157,24 +178,18 @@ describe('verifyUSDCPayment', () => {
     });
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('Transaction not found or not confirmed yet');
+    expect(result.errorCode).toBe('TX_NOT_FOUND');
   });
 
-  it('returns invalid when no token transfer instruction exists', async () => {
-    mockState.parsedTransaction = mockParsedTransaction([
-      {
-        program: 'system',
-        parsed: {
-          type: 'transfer',
-          info: {
-            lamports: 1000,
-          },
-        },
-      },
-    ]);
+  it('returns TX_FAILED when the on-chain tx errored', async () => {
+    mockState.parsedTransaction = mockTx({
+      err: { InstructionError: [0, 'Custom'] },
+      preTokenBalances: [],
+      postTokenBalances: [],
+    });
 
     const result = await verifyUSDCPayment({
-      txSignature: '6sSig1111111111111111111111111111111111111111111111111',
+      txSignature: 'Sig33333333333333333333333333333333333333333',
       expectedRecipient: EXPECTED_RECIPIENT,
       expectedAmountUsdc: 0.001,
       rpcUrl: 'https://api.devnet.solana.com',
@@ -182,27 +197,20 @@ describe('verifyUSDCPayment', () => {
     });
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('No SPL token Transfer/TransferChecked');
+    expect(result.errorCode).toBe('TX_FAILED');
   });
 
-  it('returns invalid when transfer is not USDC mint', async () => {
-    const destinationTokenAccount = 'DestTokenAcct111111111111111111111111111111';
-
-    mockState.parsedTransaction = mockParsedTransaction([
-      parsedTransferCheckedInstruction({
-        amountRaw: '1000',
-        destinationTokenAccount,
-        mint: 'OtherMint1111111111111111111111111111111111111',
-      }),
-    ]);
-
-    mockState.accountInfoByPubkey.set(
-      destinationTokenAccount,
-      tokenAccountInfo(EXPECTED_RECIPIENT, 'OtherMint1111111111111111111111111111111111111'),
-    );
+  it('returns TX_TOO_OLD when blockTime is past the freshness window', async () => {
+    mockState.parsedTransaction = mockTx({
+      blockTime: Math.floor(Date.now() / 1000) - 10_000,
+      preTokenBalances: [tokenBalance(0, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '0')],
+      postTokenBalances: [
+        tokenBalance(0, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '1000'),
+      ],
+    });
 
     const result = await verifyUSDCPayment({
-      txSignature: '7tSig1111111111111111111111111111111111111111111111111',
+      txSignature: 'Sig44444444444444444444444444444444444444444',
       expectedRecipient: EXPECTED_RECIPIENT,
       expectedAmountUsdc: 0.001,
       rpcUrl: 'https://api.devnet.solana.com',
@@ -210,30 +218,20 @@ describe('verifyUSDCPayment', () => {
     });
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('No USDC transfer found in transaction');
+    expect(result.errorCode).toBe('TX_TOO_OLD');
   });
 
-  it('returns invalid when USDC transfer is sent to a different recipient owner', async () => {
-    const destinationTokenAccount = 'DestTokenAcct222222222222222222222222222222';
-
-    mockState.parsedTransaction = mockParsedTransaction([
-      parsedTransferCheckedInstruction({
-        amountRaw: '1000',
-        destinationTokenAccount,
-        mint: EXPECTED_USDC_MINT,
-      }),
-    ]);
-
-    mockState.accountInfoByPubkey.set(
-      destinationTokenAccount,
-      tokenAccountInfo(
-        'AnotherRecipient1111111111111111111111111111',
-        EXPECTED_USDC_MINT,
-      ),
-    );
+  it('returns TX_TIME_UNAVAILABLE when blockTime is missing and freshness is enforced', async () => {
+    mockState.parsedTransaction = mockTx({
+      blockTime: null,
+      preTokenBalances: [tokenBalance(0, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '0')],
+      postTokenBalances: [
+        tokenBalance(0, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '1000'),
+      ],
+    });
 
     const result = await verifyUSDCPayment({
-      txSignature: '8uSig1111111111111111111111111111111111111111111111111',
+      txSignature: 'Sig55555555555555555555555555555555555555555',
       expectedRecipient: EXPECTED_RECIPIENT,
       expectedAmountUsdc: 0.001,
       rpcUrl: 'https://api.devnet.solana.com',
@@ -241,36 +239,20 @@ describe('verifyUSDCPayment', () => {
     });
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain(
-      'USDC transfer was not sent to the expected recipient',
-    );
+    expect(result.errorCode).toBe('TX_TIME_UNAVAILABLE');
   });
 
-  it('returns invalid with actual amount when amount is insufficient', async () => {
-    const destinationTokenAccount = 'DestTokenAcct333333333333333333333333333333';
-    const sourceTokenAccount = 'SourceTokenAcct33333333333333333333333333333';
-
-    mockState.parsedTransaction = mockParsedTransaction([
-      parsedTransferCheckedInstruction({
-        amountRaw: '500',
-        destinationTokenAccount,
-        sourceTokenAccount,
-        authority: 'SenderAuthority33333333333333333333333333333',
-        mint: EXPECTED_USDC_MINT,
-      }),
-    ]);
-
-    mockState.accountInfoByPubkey.set(
-      destinationTokenAccount,
-      tokenAccountInfo(EXPECTED_RECIPIENT, EXPECTED_USDC_MINT),
-    );
-    mockState.accountInfoByPubkey.set(
-      sourceTokenAccount,
-      tokenAccountInfo('SenderWallet3333333333333333333333333333333', EXPECTED_USDC_MINT),
-    );
+  it('returns NO_USDC_TRANSFER when no USDC moved', async () => {
+    mockState.parsedTransaction = mockTx({
+      preTokenBalances: [tokenBalance(0, SENDER_WALLET, OTHER_MINT, '1000')],
+      postTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, OTHER_MINT, '0'),
+        tokenBalance(1, EXPECTED_RECIPIENT, OTHER_MINT, '1000'),
+      ],
+    });
 
     const result = await verifyUSDCPayment({
-      txSignature: '9vSig1111111111111111111111111111111111111111111111111',
+      txSignature: 'Sig66666666666666666666666666666666666666666',
       expectedRecipient: EXPECTED_RECIPIENT,
       expectedAmountUsdc: 0.001,
       rpcUrl: 'https://api.devnet.solana.com',
@@ -278,49 +260,75 @@ describe('verifyUSDCPayment', () => {
     });
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('Insufficient USDC amount');
+    expect(result.errorCode).toBe('NO_USDC_TRANSFER');
+  });
+
+  it('returns WRONG_RECIPIENT when USDC was transferred to someone else', async () => {
+    mockState.parsedTransaction = mockTx({
+      preTokenBalances: [tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '1000')],
+      postTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '0'),
+        tokenBalance(
+          1,
+          'AnotherRecipient1111111111111111111111111111',
+          EXPECTED_USDC_MINT,
+          '1000',
+        ),
+      ],
+    });
+
+    const result = await verifyUSDCPayment({
+      txSignature: 'Sig77777777777777777777777777777777777777777',
+      expectedRecipient: EXPECTED_RECIPIENT,
+      expectedAmountUsdc: 0.001,
+      rpcUrl: 'https://api.devnet.solana.com',
+      usdcMintAddress: EXPECTED_USDC_MINT,
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errorCode).toBe('WRONG_RECIPIENT');
+  });
+
+  it('returns INSUFFICIENT_AMOUNT with actual amount and sender when credit is under expected', async () => {
+    mockState.parsedTransaction = mockTx({
+      preTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '500'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '0'),
+      ],
+      postTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '0'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '500'),
+      ],
+    });
+
+    const result = await verifyUSDCPayment({
+      txSignature: 'Sig88888888888888888888888888888888888888888',
+      expectedRecipient: EXPECTED_RECIPIENT,
+      expectedAmountUsdc: 0.001,
+      rpcUrl: 'https://api.devnet.solana.com',
+      usdcMintAddress: EXPECTED_USDC_MINT,
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errorCode).toBe('INSUFFICIENT_AMOUNT');
     expect(result.actualAmountUsdc).toBe(0.0005);
-    expect(result.senderWallet).toBe('SenderAuthority33333333333333333333333333333');
+    expect(result.senderWallet).toBe(SENDER_WALLET);
   });
 
-  it('returns valid when transferChecked in inner instructions meets recipient and amount', async () => {
-    const destinationTokenAccount = 'DestTokenAcct444444444444444444444444444444';
-    const sourceTokenAccount = 'SourceTokenAcct44444444444444444444444444444';
-
-    mockState.parsedTransaction = {
-      meta: {
-        innerInstructions: [
-          {
-            instructions: [
-              parsedTransferCheckedInstruction({
-                amountRaw: '1500',
-                destinationTokenAccount,
-                sourceTokenAccount,
-                authority: 'SenderAuthority44444444444444444444444444444',
-                mint: EXPECTED_USDC_MINT,
-              }),
-            ],
-          },
-        ],
-      },
-      transaction: {
-        message: {
-          instructions: [],
-        },
-      },
-    };
-
-    mockState.accountInfoByPubkey.set(
-      destinationTokenAccount,
-      tokenAccountInfo(EXPECTED_RECIPIENT, EXPECTED_USDC_MINT),
-    );
-    mockState.accountInfoByPubkey.set(
-      sourceTokenAccount,
-      tokenAccountInfo('SenderWallet4444444444444444444444444444444', EXPECTED_USDC_MINT),
-    );
+  it('returns valid when the recipient delta meets the expected amount', async () => {
+    mockState.parsedTransaction = mockTx({
+      preTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '2000'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '0'),
+      ],
+      postTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '500'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '1500'),
+      ],
+    });
 
     const result = await verifyUSDCPayment({
-      txSignature: 'AaSig1111111111111111111111111111111111111111111111111',
+      txSignature: 'Sig99999999999999999999999999999999999999999',
       expectedRecipient: EXPECTED_RECIPIENT,
       expectedAmountUsdc: 0.001,
       rpcUrl: 'https://api.devnet.solana.com',
@@ -329,14 +337,72 @@ describe('verifyUSDCPayment', () => {
 
     expect(result.valid).toBe(true);
     expect(result.actualAmountUsdc).toBe(0.0015);
-    expect(result.senderWallet).toBe('SenderAuthority44444444444444444444444444444');
+    expect(result.senderWallet).toBe(SENDER_WALLET);
   });
 
-  it('returns invalid with network error details when RPC call fails', async () => {
-    mockState.transactionError = new Error('RPC unavailable');
+  it('credits the destination correctly when multiple USDC ATAs belong to the recipient', async () => {
+    mockState.parsedTransaction = mockTx({
+      preTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '2000'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '100'),
+        tokenBalance(2, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '200'),
+      ],
+      postTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '0'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '1100'),
+        tokenBalance(2, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '1200'),
+      ],
+    });
 
     const result = await verifyUSDCPayment({
-      txSignature: 'BbSig1111111111111111111111111111111111111111111111111',
+      txSignature: 'SigAA2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2',
+      expectedRecipient: EXPECTED_RECIPIENT,
+      expectedAmountUsdc: 0.002,
+      rpcUrl: 'https://api.devnet.solana.com',
+      usdcMintAddress: EXPECTED_USDC_MINT,
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.actualAmountUsdc).toBe(0.002);
+  });
+
+  it('ignores non-USDC transfers when computing the delta (Token-2022 fee hardening)', async () => {
+    // A large delta on a different mint must not count toward the USDC credit.
+    mockState.parsedTransaction = mockTx({
+      preTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '400'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '0'),
+        tokenBalance(2, SENDER_WALLET, OTHER_MINT, '10000'),
+        tokenBalance(3, EXPECTED_RECIPIENT, OTHER_MINT, '0'),
+      ],
+      postTokenBalances: [
+        tokenBalance(0, SENDER_WALLET, EXPECTED_USDC_MINT, '0'),
+        tokenBalance(1, EXPECTED_RECIPIENT, EXPECTED_USDC_MINT, '400'),
+        tokenBalance(2, SENDER_WALLET, OTHER_MINT, '0'),
+        tokenBalance(3, EXPECTED_RECIPIENT, OTHER_MINT, '10000'),
+      ],
+    });
+
+    const result = await verifyUSDCPayment({
+      txSignature: 'SigBB2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2',
+      expectedRecipient: EXPECTED_RECIPIENT,
+      expectedAmountUsdc: 0.001, // 1000 raw USDC required, only 400 received
+      rpcUrl: 'https://api.devnet.solana.com',
+      usdcMintAddress: EXPECTED_USDC_MINT,
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errorCode).toBe('INSUFFICIENT_AMOUNT');
+    expect(result.actualAmountUsdc).toBe(0.0004);
+  });
+
+  it('returns RPC_UNAVAILABLE without leaking the raw error text', async () => {
+    mockState.transactionError = new Error(
+      'fetch failed: https://rpc.example.com/?api-key=SECRET_KEY_123',
+    );
+
+    const result = await verifyUSDCPayment({
+      txSignature: 'SigCC2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2C2',
       expectedRecipient: EXPECTED_RECIPIENT,
       expectedAmountUsdc: 0.001,
       rpcUrl: 'https://api.devnet.solana.com',
@@ -344,15 +410,38 @@ describe('verifyUSDCPayment', () => {
     });
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('Verification failed: RPC unavailable');
+    expect(result.errorCode).toBe('RPC_UNAVAILABLE');
+    expect(result.error).not.toContain('SECRET_KEY_123');
+    expect(result.error).not.toContain('rpc.example.com');
+    expect(result.error).not.toContain('api-key');
   });
 
-  it('returns invalid when transaction fetch times out', async () => {
+  it('delivers the raw RPC error to onError server-side only', async () => {
+    const secret = 'https://rpc.example.com/?api-key=SECRET_KEY_123';
+    mockState.transactionError = new Error(`fetch failed: ${secret}`);
+
+    const captured: Array<{ scope: string; error: unknown }> = [];
+    const result = await verifyUSDCPayment({
+      txSignature: 'SigDD2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2D2',
+      expectedRecipient: EXPECTED_RECIPIENT,
+      expectedAmountUsdc: 0.001,
+      rpcUrl: 'https://api.devnet.solana.com',
+      usdcMintAddress: EXPECTED_USDC_MINT,
+      onError: (scope, error) => captured.push({ scope, error }),
+    });
+
+    expect(result.valid).toBe(false);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.scope).toBe('getParsedTransaction');
+    expect((captured[0]?.error as Error).message).toContain(secret);
+  });
+
+  it('times out cleanly with RPC_UNAVAILABLE', async () => {
     vi.useFakeTimers();
     mockState.transactionDelayMs = 60_000;
 
     const resultPromise = verifyUSDCPayment({
-      txSignature: 'CcSig1111111111111111111111111111111111111111111111111',
+      txSignature: 'SigEE2E2E2E2E2E2E2E2E2E2E2E2E2E2E2E2E2E2E2E2',
       expectedRecipient: EXPECTED_RECIPIENT,
       expectedAmountUsdc: 0.001,
       rpcUrl: 'https://api.devnet.solana.com',
@@ -363,6 +452,6 @@ describe('verifyUSDCPayment', () => {
     const result = await resultPromise;
 
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('Timed out while fetching transaction from RPC');
+    expect(result.errorCode).toBe('RPC_UNAVAILABLE');
   });
 });

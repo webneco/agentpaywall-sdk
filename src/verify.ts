@@ -1,39 +1,70 @@
 import {
-  type ParsedAccountData,
-  type ParsedInstruction,
   type ParsedTransactionWithMeta,
-  type PartiallyDecodedInstruction,
+  type TokenBalance,
   Connection,
   PublicKey,
 } from '@solana/web3.js';
-import type { PaymentVerificationResult } from './types';
+import type {
+  PaymentVerificationResult,
+  VerificationErrorCode,
+} from './types';
 
 const DEVNET_USDC = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
 const MAINNET_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDC_DECIMALS = 6;
 const RPC_TIMEOUT_MS = 30_000;
+// Transactions older than this are rejected by default. Defence-in-depth on
+// top of the replay store: bounds the reuse window even if the store is
+// misconfigured or shared state drops.
+const DEFAULT_MAX_TX_AGE_SECONDS = 300;
 
-type TokenAccountMeta = {
-  owner: string;
-  mint: string;
+// Only Solana's public RPC hosts get mint inference. Custom / authenticated
+// RPCs (Helius, QuickNode, Alchemy, etc.) MUST pass usdcMintAddress explicitly
+// — substring-matching hostnames is brittle and was previously exploitable
+// via names like `mainnet-staging.<custom>`.
+const KNOWN_DEVNET_HOSTS = new Set(['api.devnet.solana.com']);
+const KNOWN_MAINNET_HOSTS = new Set([
+  'api.mainnet-beta.solana.com',
+  'api.metaplex.solana.com',
+]);
+
+// Maps internal failure modes to stable, public-safe strings. Nothing
+// returned to the client may contain dynamic state (RPC URLs, user-supplied
+// strings, stack frames). The only dynamic detail surfaced is the numeric
+// amount in INSUFFICIENT_AMOUNT, which is returned in its own field.
+const PUBLIC_ERRORS: Record<VerificationErrorCode, string> = {
+  MISSING_SIGNATURE: 'Missing transaction signature',
+  INVALID_REQUEST: 'Invalid verification request',
+  TX_NOT_FOUND: 'Transaction not found or not confirmed yet',
+  TX_FAILED: 'Transaction failed on-chain — tokens were not transferred',
+  TX_TOO_OLD: 'Transaction is older than the allowed freshness window',
+  TX_TIME_UNAVAILABLE:
+    'Transaction block time unavailable — cannot verify freshness',
+  NO_USDC_TRANSFER:
+    'No USDC transfer to the expected recipient was found in this transaction',
+  WRONG_RECIPIENT: 'USDC transfer was not sent to the expected recipient wallet',
+  INSUFFICIENT_AMOUNT: 'Insufficient USDC amount transferred to recipient',
+  RPC_UNAVAILABLE:
+    'Solana RPC request failed — retry or use a different endpoint',
+  INTERNAL_ERROR: 'Internal verification error',
 };
 
-type ParsedTokenTransfer = {
-  amountRaw: bigint;
-  sourceTokenAccount?: string;
-  destinationTokenAccount: string;
-  senderAuthority?: string;
-  mintFromInstruction?: string;
-};
+function fail(
+  code: VerificationErrorCode,
+  extra?: Partial<PaymentVerificationResult>,
+): PaymentVerificationResult {
+  return {
+    valid: false,
+    error: PUBLIC_ERRORS[code],
+    errorCode: code,
+    ...extra,
+  };
+}
 
-function withTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  timeoutMessage: string,
-): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(timeoutMessage));
+      reject(new Error('RPC_TIMEOUT'));
     }, timeoutMs);
 
     promise
@@ -46,16 +77,6 @@ function withTimeout<T>(
         reject(error);
       });
   });
-}
-
-function isParsedInstruction(
-  instruction: ParsedInstruction | PartiallyDecodedInstruction,
-): instruction is ParsedInstruction {
-  return 'parsed' in instruction;
-}
-
-function isTokenProgram(program: string): boolean {
-  return program === 'spl-token' || program === 'spl-token-2022';
 }
 
 function toBigInt(value: unknown): bigint | null {
@@ -74,188 +95,91 @@ function toBigInt(value: unknown): bigint | null {
   }
 }
 
-function safeErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  return 'Unknown verification error';
-}
-
-function inferDefaultUsdcMint(rpcUrl: string): string {
-  return rpcUrl.includes('mainnet') ? MAINNET_USDC : DEVNET_USDC;
-}
-
-function parseTransferInstruction(
-  instruction: ParsedInstruction,
-): ParsedTokenTransfer | null {
-  if (!isTokenProgram(instruction.program)) {
-    return null;
-  }
-
-  if (
-    typeof instruction.parsed !== 'object' ||
-    instruction.parsed === null ||
-    !('type' in instruction.parsed) ||
-    !('info' in instruction.parsed)
-  ) {
-    return null;
-  }
-
-  const parsed = instruction.parsed as {
-    type?: unknown;
-    info?: unknown;
-  };
-
-  if (parsed.type !== 'transfer' && parsed.type !== 'transferChecked') {
-    return null;
-  }
-
-  if (typeof parsed.info !== 'object' || parsed.info === null) {
-    return null;
-  }
-
-  const info = parsed.info as Record<string, unknown>;
-
-  const destinationTokenAccount =
-    typeof info.destination === 'string' ? info.destination : undefined;
-  if (!destinationTokenAccount) {
-    return null;
-  }
-
-  const sourceTokenAccount =
-    typeof info.source === 'string' ? info.source : undefined;
-  const senderAuthority =
-    typeof info.authority === 'string' ? info.authority : undefined;
-  const mintFromInstruction =
-    typeof info.mint === 'string' ? info.mint : undefined;
-
-  let amountRaw: bigint | null = null;
-
-  if (parsed.type === 'transferChecked') {
-    const tokenAmount = info.tokenAmount;
-    if (typeof tokenAmount === 'object' && tokenAmount !== null) {
-      amountRaw = toBigInt(
-        (tokenAmount as { amount?: unknown }).amount,
-      );
-    }
-
-    if (amountRaw === null) {
-      amountRaw = toBigInt(info.amount);
-    }
-  } else {
-    amountRaw = toBigInt(info.amount);
-  }
-
-  if (amountRaw === null) {
-    return null;
-  }
-
-  return {
-    amountRaw,
-    sourceTokenAccount,
-    destinationTokenAccount,
-    senderAuthority,
-    mintFromInstruction,
-  };
-}
-
-function collectParsedInstructions(
-  transaction: ParsedTransactionWithMeta,
-): ParsedInstruction[] {
-  const parsedInstructions: ParsedInstruction[] = [];
-
-  for (const instruction of transaction.transaction.message.instructions) {
-    if (isParsedInstruction(instruction)) {
-      parsedInstructions.push(instruction);
-    }
-  }
-
-  for (const innerInstruction of transaction.meta?.innerInstructions ?? []) {
-    for (const instruction of innerInstruction.instructions) {
-      if (isParsedInstruction(instruction)) {
-        parsedInstructions.push(instruction);
-      }
-    }
-  }
-
-  return parsedInstructions;
-}
-
-function readTokenAccountMeta(value: unknown): TokenAccountMeta | null {
-  if (typeof value !== 'object' || value === null) {
-    return null;
-  }
-
-  const accountValue = value as {
-    data?: unknown;
-  };
-  const data = accountValue.data;
-
-  if (typeof data !== 'object' || data === null || !('parsed' in data)) {
-    return null;
-  }
-
-  const parsedData = data as ParsedAccountData;
-  if (typeof parsedData.parsed !== 'object' || parsedData.parsed === null) {
-    return null;
-  }
-
-  const parsed = parsedData.parsed as {
-    info?: unknown;
-  };
-
-  if (typeof parsed.info !== 'object' || parsed.info === null) {
-    return null;
-  }
-
-  const info = parsed.info as Record<string, unknown>;
-  const owner = typeof info.owner === 'string' ? info.owner : undefined;
-  const mint = typeof info.mint === 'string' ? info.mint : undefined;
-
-  if (!owner || !mint) {
-    return null;
-  }
-
-  return { owner, mint };
-}
-
-async function getTokenAccountMeta(
-  connection: Connection,
-  tokenAccountAddress: string,
-  cache: Map<string, TokenAccountMeta | null>,
-): Promise<TokenAccountMeta | null> {
-  if (cache.has(tokenAccountAddress)) {
-    return cache.get(tokenAccountAddress) ?? null;
-  }
-
-  let publicKey: PublicKey;
+function inferUsdcMint(rpcUrl: string): string | null {
+  let host: string;
   try {
-    publicKey = new PublicKey(tokenAccountAddress);
+    host = new URL(rpcUrl).hostname;
   } catch {
-    cache.set(tokenAccountAddress, null);
     return null;
   }
-
-  try {
-    const accountInfo = await withTimeout(
-      connection.getParsedAccountInfo(publicKey, 'confirmed'),
-      RPC_TIMEOUT_MS,
-      'Timed out while fetching token account metadata',
-    );
-
-    const meta = readTokenAccountMeta(accountInfo.value);
-    cache.set(tokenAccountAddress, meta);
-    return meta;
-  } catch {
-    cache.set(tokenAccountAddress, null);
-    return null;
-  }
+  if (KNOWN_MAINNET_HOSTS.has(host)) return MAINNET_USDC;
+  if (KNOWN_DEVNET_HOSTS.has(host)) return DEVNET_USDC;
+  return null;
 }
 
 /**
- * Verifies that a Solana transaction contains a USDC transfer meeting the expected amount and recipient.
- * This function never throws; all failure states are returned as { valid: false, error }.
+ * Sums per-owner USDC balance deltas from meta.preTokenBalances /
+ * meta.postTokenBalances. Using on-chain balance deltas rather than the
+ * instruction `amount` field is critical:
+ *   - The delta is the authoritative amount the recipient received, which
+ *     correctly accounts for Token-2022 transfer-fee extensions (where the
+ *     instruction amount is gross but the recipient's credit is net).
+ *   - It naturally aggregates multiple transfers to the same owner.
+ *   - It is immune to whatever an attacker can fit into an instruction
+ *     list, because it reflects what actually settled.
+ *
+ * Each owner may have multiple token accounts for the same mint. We sum
+ * across them so that a sender moving funds between their own ATAs doesn't
+ * produce spurious "senders" in results.
+ */
+function computeUsdcOwnerDeltas(
+  pre: readonly TokenBalance[] | null | undefined,
+  post: readonly TokenBalance[] | null | undefined,
+  usdcMintAddress: string,
+): Map<string, bigint> {
+  const preByOwner = new Map<string, bigint>();
+  const postByOwner = new Map<string, bigint>();
+
+  for (const entry of pre ?? []) {
+    if (entry.mint !== usdcMintAddress || !entry.owner) continue;
+    const amount = toBigInt(entry.uiTokenAmount.amount);
+    if (amount === null) continue;
+    preByOwner.set(entry.owner, (preByOwner.get(entry.owner) ?? 0n) + amount);
+  }
+
+  for (const entry of post ?? []) {
+    if (entry.mint !== usdcMintAddress || !entry.owner) continue;
+    const amount = toBigInt(entry.uiTokenAmount.amount);
+    if (amount === null) continue;
+    postByOwner.set(entry.owner, (postByOwner.get(entry.owner) ?? 0n) + amount);
+  }
+
+  const owners = new Set<string>();
+  for (const owner of preByOwner.keys()) owners.add(owner);
+  for (const owner of postByOwner.keys()) owners.add(owner);
+
+  const deltas = new Map<string, bigint>();
+  for (const owner of owners) {
+    const preTotal = preByOwner.get(owner) ?? 0n;
+    const postTotal = postByOwner.get(owner) ?? 0n;
+    deltas.set(owner, postTotal - preTotal);
+  }
+
+  return deltas;
+}
+
+/**
+ * Verifies that a Solana transaction credited the expected recipient with at
+ * least the expected USDC amount. Never throws; all failure states return
+ * `{ valid: false, error, errorCode }`.
+ *
+ * Security invariants:
+ * - Failed transactions are rejected (`meta.err` truthy).
+ * - Transactions older than `maxTxAgeSeconds` (default 300) are rejected.
+ *   This bounds replay reuse even if the replay store is misconfigured.
+ * - Verification uses balance deltas from `meta.pre/postTokenBalances`, not
+ *   instruction `amount` fields, so Token-2022 transfer fees cannot cause
+ *   under-payment to pass as valid.
+ * - For custom / authenticated RPC endpoints you MUST pass `usdcMintAddress`
+ *   explicitly; the inference path only recognises Solana's public RPC
+ *   hosts and returns INVALID_REQUEST otherwise.
+ * - No dynamic error text reaches the returned `error` field. Raw RPC
+ *   errors (which may include private RPC URLs / API keys) are handed to
+ *   `params.onError` and logged server-side only.
+ * - Commitment is 'confirmed', not 'finalized', for latency. On mainnet
+ *   reorgs past 'confirmed' are astronomically rare; callers who require
+ *   finalized certainty should widen `maxTxAgeSeconds` and pre-wait client
+ *   side.
  */
 export async function verifyUSDCPayment(params: {
   txSignature: string;
@@ -263,174 +187,140 @@ export async function verifyUSDCPayment(params: {
   expectedAmountUsdc: number;
   rpcUrl: string;
   usdcMintAddress?: string;
+  timeoutMs?: number;
+  maxTxAgeSeconds?: number;
+  onError?: (scope: string, error: unknown) => void;
 }): Promise<PaymentVerificationResult> {
+  const reportError = (scope: string, error: unknown): void => {
+    try {
+      params.onError?.(scope, error);
+    } catch {
+      // Never let a caller-supplied logger break verification.
+    }
+  };
+
   try {
     if (!params.txSignature?.trim()) {
-      return { valid: false, error: 'Missing transaction signature' };
+      return fail('MISSING_SIGNATURE');
     }
 
     if (
       !Number.isFinite(params.expectedAmountUsdc) ||
       params.expectedAmountUsdc <= 0
     ) {
-      return { valid: false, error: 'Expected amount must be greater than zero' };
+      return fail('INVALID_REQUEST');
     }
 
     try {
       void new PublicKey(params.expectedRecipient);
     } catch {
-      return { valid: false, error: 'Invalid expected recipient wallet address' };
+      return fail('INVALID_REQUEST');
     }
 
     const usdcMintAddress =
-      params.usdcMintAddress ?? inferDefaultUsdcMint(params.rpcUrl);
+      params.usdcMintAddress ?? inferUsdcMint(params.rpcUrl);
+    if (!usdcMintAddress) {
+      return fail('INVALID_REQUEST');
+    }
 
     try {
       void new PublicKey(usdcMintAddress);
     } catch {
-      return { valid: false, error: 'Invalid USDC mint address' };
+      return fail('INVALID_REQUEST');
     }
 
     const expectedAmountRaw = toBigInt(
-      Math.round((params.expectedAmountUsdc + Number.EPSILON) * 10 ** USDC_DECIMALS),
+      Math.round(params.expectedAmountUsdc * 10 ** USDC_DECIMALS),
     );
-
     if (expectedAmountRaw === null || expectedAmountRaw <= 0n) {
-      return {
-        valid: false,
-        error: 'Expected amount is too small after USDC decimal conversion',
-      };
+      return fail('INVALID_REQUEST');
     }
 
+    const timeoutMs = params.timeoutMs ?? RPC_TIMEOUT_MS;
     const connection = new Connection(params.rpcUrl, 'confirmed');
 
-    const parsedTransaction = await withTimeout(
-      connection.getParsedTransaction(params.txSignature, {
-        commitment: 'confirmed',
-        maxSupportedTransactionVersion: 0,
-      }),
-      RPC_TIMEOUT_MS,
-      'Timed out while fetching transaction from RPC',
+    let parsedTransaction: ParsedTransactionWithMeta | null;
+    try {
+      parsedTransaction = await withTimeout(
+        connection.getParsedTransaction(params.txSignature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0,
+        }),
+        timeoutMs,
+      );
+    } catch (error) {
+      reportError('getParsedTransaction', error);
+      return fail('RPC_UNAVAILABLE');
+    }
+
+    if (!parsedTransaction || !parsedTransaction.meta) {
+      return fail('TX_NOT_FOUND');
+    }
+
+    if (parsedTransaction.meta.err) {
+      return fail('TX_FAILED');
+    }
+
+    const maxTxAgeSeconds =
+      params.maxTxAgeSeconds ?? DEFAULT_MAX_TX_AGE_SECONDS;
+
+    if (maxTxAgeSeconds > 0) {
+      if (parsedTransaction.blockTime == null) {
+        return fail('TX_TIME_UNAVAILABLE');
+      }
+      const ageSeconds =
+        Math.floor(Date.now() / 1000) - parsedTransaction.blockTime;
+      if (ageSeconds > maxTxAgeSeconds) {
+        return fail('TX_TOO_OLD');
+      }
+    }
+
+    const deltas = computeUsdcOwnerDeltas(
+      parsedTransaction.meta.preTokenBalances,
+      parsedTransaction.meta.postTokenBalances,
+      usdcMintAddress,
     );
 
-    if (!parsedTransaction) {
-      return {
-        valid: false,
-        error: 'Transaction not found or not confirmed yet',
-      };
-    }
+    const recipientDelta = deltas.get(params.expectedRecipient) ?? 0n;
 
-    if (!parsedTransaction.meta) {
-      return {
-        valid: false,
-        error: 'Malformed transaction: missing metadata',
-      };
-    }
-
-    const parsedInstructions = collectParsedInstructions(parsedTransaction);
-    const tokenAccountCache = new Map<string, TokenAccountMeta | null>();
-
-    let sawTokenTransfer = false;
-    let sawUsdcTransfer = false;
-    let sawExpectedRecipient = false;
-    let bestAmountRaw = 0n;
-    let bestSenderWallet: string | undefined;
-
-    for (const instruction of parsedInstructions) {
-      const transfer = parseTransferInstruction(instruction);
-      if (!transfer) {
-        continue;
-      }
-
-      sawTokenTransfer = true;
-
-      const destinationMeta = await getTokenAccountMeta(
-        connection,
-        transfer.destinationTokenAccount,
-        tokenAccountCache,
-      );
-
-      if (!destinationMeta) {
-        continue;
-      }
-
-      const mintMatches =
-        destinationMeta.mint === usdcMintAddress &&
-        (transfer.mintFromInstruction === undefined ||
-          transfer.mintFromInstruction === usdcMintAddress);
-
-      if (!mintMatches) {
-        continue;
-      }
-
-      sawUsdcTransfer = true;
-
-      if (destinationMeta.owner !== params.expectedRecipient) {
-        continue;
-      }
-
-      sawExpectedRecipient = true;
-
-      const sourceMeta = transfer.sourceTokenAccount
-        ? await getTokenAccountMeta(
-            connection,
-            transfer.sourceTokenAccount,
-            tokenAccountCache,
-          )
-        : null;
-
-      if (transfer.amountRaw > bestAmountRaw) {
-        bestAmountRaw = transfer.amountRaw;
-        bestSenderWallet = transfer.senderAuthority ?? sourceMeta?.owner;
-      }
-
-      if (transfer.amountRaw >= expectedAmountRaw) {
-        return {
-          valid: true,
-          actualAmountUsdc: Number(transfer.amountRaw) / 10 ** USDC_DECIMALS,
-          senderWallet: transfer.senderAuthority ?? sourceMeta?.owner,
-        };
+    // Derive sender from the largest net USDC debit on this tx. This reflects
+    // what actually settled rather than what a delegate field reported.
+    let senderWallet: string | undefined;
+    let largestNegativeDelta = 0n;
+    for (const [owner, delta] of deltas.entries()) {
+      if (delta < largestNegativeDelta) {
+        largestNegativeDelta = delta;
+        senderWallet = owner;
       }
     }
 
-    if (!sawTokenTransfer) {
-      return {
-        valid: false,
-        error: 'No SPL token Transfer/TransferChecked instruction found',
-      };
+    if (recipientDelta <= 0n) {
+      // Distinguish "someone else got USDC" from "no USDC moved at all" for
+      // clearer developer-facing errors.
+      let anyUsdcCredit = false;
+      for (const delta of deltas.values()) {
+        if (delta > 0n) {
+          anyUsdcCredit = true;
+          break;
+        }
+      }
+      return fail(anyUsdcCredit ? 'WRONG_RECIPIENT' : 'NO_USDC_TRANSFER');
     }
 
-    if (!sawUsdcTransfer) {
-      return {
-        valid: false,
-        error: 'No USDC transfer found in transaction',
-      };
-    }
-
-    if (!sawExpectedRecipient) {
-      return {
-        valid: false,
-        error: 'USDC transfer was not sent to the expected recipient',
-      };
-    }
-
-    if (bestAmountRaw > 0n) {
-      return {
-        valid: false,
-        actualAmountUsdc: Number(bestAmountRaw) / 10 ** USDC_DECIMALS,
-        senderWallet: bestSenderWallet,
-        error: 'Insufficient USDC amount',
-      };
+    if (recipientDelta < expectedAmountRaw) {
+      return fail('INSUFFICIENT_AMOUNT', {
+        actualAmountUsdc: Number(recipientDelta) / 10 ** USDC_DECIMALS,
+        senderWallet,
+      });
     }
 
     return {
-      valid: false,
-      error: 'Unable to verify payment from transaction',
+      valid: true,
+      actualAmountUsdc: Number(recipientDelta) / 10 ** USDC_DECIMALS,
+      senderWallet,
     };
   } catch (error: unknown) {
-    return {
-      valid: false,
-      error: `Verification failed: ${safeErrorMessage(error)}`,
-    };
+    reportError('verifyUSDCPayment', error);
+    return fail('INTERNAL_ERROR');
   }
 }

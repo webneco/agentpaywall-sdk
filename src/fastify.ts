@@ -11,42 +11,52 @@ import {
 import type { AgentPaywallConfig, ReplayStore } from './types';
 import { verifyUSDCPayment } from './verify';
 
-type NextHandler = (request: Request) => Promise<Response>;
-
-// Vercel / serverless note: this default store is per-lambda-instance. On
-// Vercel you MUST pass config.replayStore — a warning is logged at
-// middleware construction if the Vercel env is detected without a store.
 const defaultReplayStore: ReplayStore = createInMemoryReplayStore();
 
+type FastifyRequest = {
+  headers: Record<string, string | string[] | undefined>;
+};
+
+type FastifyReply = {
+  code(statusCode: number): FastifyReply;
+  header(name: string, value: string): FastifyReply;
+  send(payload: unknown): void;
+};
+
 /**
- * Wraps a Next.js App Router route handler with AgentPaywall payment enforcement.
+ * Creates a Fastify preHandler that enforces USDC payment before allowing access to a route handler.
  */
-export function withAgentPaywall(
-  config: AgentPaywallConfig,
-  handler: NextHandler,
-) {
+export function agentPaywallFastify(config: AgentPaywallConfig) {
   const replayStore = config.replayStore ?? defaultReplayStore;
   if (!config.replayStore) maybeWarnAboutMultiInstanceReplay();
 
-  return async (request: Request): Promise<Response> => {
-    const paymentProof = request.headers.get('x-payment-proof') ?? undefined;
+  return async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    const proofHeader = req.headers['x-payment-proof'];
+    const paymentProof =
+      typeof proofHeader === 'string'
+        ? proofHeader
+        : Array.isArray(proofHeader)
+          ? proofHeader[0]
+          : undefined;
 
     if (!paymentProof) {
-      return Response.json(build402Response(config), { status: 402 });
+      reply
+        .code(402)
+        .header('Content-Type', 'application/json')
+        .send(build402Response(config));
+      return;
     }
 
     if (
       config.allowReplay !== true &&
       (await replayStore.seen(paymentProof))
     ) {
-      return Response.json(
-        {
-          error: 'Forbidden',
-          code: 'REPLAY_DETECTED',
-          message: 'Transaction signature has already been used',
-        },
-        { status: 403 },
-      );
+      reply.code(403).header('Content-Type', 'application/json').send({
+        error: 'Forbidden',
+        code: 'REPLAY_DETECTED',
+        message: 'Transaction signature has already been used',
+      });
+      return;
     }
 
     const result = await verifyUSDCPayment({
@@ -61,14 +71,12 @@ export function withAgentPaywall(
     });
 
     if (!result.valid) {
-      return Response.json(
-        {
-          ...build402Response(config),
-          verificationError: result.error,
-          verificationErrorCode: result.errorCode,
-        },
-        { status: 402 },
-      );
+      reply.code(402).header('Content-Type', 'application/json').send({
+        ...build402Response(config),
+        verificationError: result.error,
+        verificationErrorCode: result.errorCode,
+      });
+      return;
     }
 
     if (config.onPaymentVerified) {
@@ -86,12 +94,7 @@ export function withAgentPaywall(
         consumerWallet: result.senderWallet ?? 'unknown',
         amountUsdc: result.actualAmountUsdc ?? config.priceUsdc,
         platformApiKey: config.platformApiKey,
-        userAgent: request.headers.get('user-agent') ?? undefined,
       });
     }
-
-    return handler(request);
   };
 }
-
-export type { NextHandler };

@@ -5,19 +5,25 @@ const MAINNET_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const DEVNET_RPC_URL = 'https://api.devnet.solana.com';
 const MAINNET_RPC_URL = 'https://api.mainnet-beta.solana.com';
 
-function getDefaultRpcUrl(config: AgentPaywallConfig): string {
-  if (config.rpcUrl) {
-    return config.rpcUrl;
-  }
-
+/**
+ * Resolves the effective RPC URL from an AgentPaywallConfig. Middlewares and
+ * build402Response MUST use this same helper so a dev who sets
+ * `network: 'mainnet-beta'` without an explicit `rpcUrl` can't end up with a
+ * 402 response advertising mainnet while the verifier silently hits devnet —
+ * an earlier version did exactly that, which rejected every real mainnet
+ * payment.
+ */
+export function resolveRpcUrl(config: AgentPaywallConfig): string {
+  if (config.rpcUrl) return config.rpcUrl;
   return config.network === 'mainnet-beta' ? MAINNET_RPC_URL : DEVNET_RPC_URL;
 }
 
-function getDefaultUsdcMintAddress(config: AgentPaywallConfig): string {
-  if (config.usdcMintAddress) {
-    return config.usdcMintAddress;
-  }
-
+/**
+ * Resolves the effective USDC mint address from config. Same co-location
+ * invariant as resolveRpcUrl above.
+ */
+export function resolveUsdcMintAddress(config: AgentPaywallConfig): string {
+  if (config.usdcMintAddress) return config.usdcMintAddress;
   return config.network === 'mainnet-beta' ? MAINNET_USDC : DEVNET_USDC;
 }
 
@@ -25,8 +31,8 @@ function getDefaultUsdcMintAddress(config: AgentPaywallConfig): string {
  * Builds a standard HTTP 402 response payload with payment instructions for the client.
  */
 export function build402Response(config: AgentPaywallConfig): Payment402Response {
-  const rpcUrl = getDefaultRpcUrl(config);
-  const usdcMintAddress = getDefaultUsdcMintAddress(config);
+  const rpcUrl = resolveRpcUrl(config);
+  const usdcMintAddress = resolveUsdcMintAddress(config);
 
   return {
     error: 'Payment Required',

@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  entry: ['src/index.ts', 'src/nextjs.ts'],
+  entry: ['src/index.ts', 'src/nextjs.ts', 'src/fastify.ts'],
   format: ['esm', 'cjs'],
   dts: true,
   sourcemap: true,

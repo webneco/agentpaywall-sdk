@@ -1,6 +1,6 @@
 {
   "name": "@agentpaywall/sdk",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Drop-in USDC micropayment middleware for APIs, settled on Solana.",
   "license": "MIT",
   "author": "Webneco",
@@ -37,6 +37,11 @@
       "types": "./dist/nextjs.d.ts",
       "import": "./dist/nextjs.mjs",
       "require": "./dist/nextjs.js"
+    },
+    "./fastify": {
+      "types": "./dist/fastify.d.ts",
+      "import": "./dist/fastify.mjs",
+      "require": "./dist/fastify.js"
     }
   },
   "files": [
@@ -62,10 +67,14 @@
   "peerDependencies": {
     "@solana/spl-token": ">=0.3.0",
     "@solana/web3.js": ">=1.0.0",
-    "express": ">=4.0.0"
+    "express": ">=4.0.0",
+    "fastify": ">=4.0.0"
   },
   "peerDependenciesMeta": {
     "express": {
+      "optional": true
+    },
+    "fastify": {
       "optional": true
     }
   },

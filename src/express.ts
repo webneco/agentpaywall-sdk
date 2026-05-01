@@ -1,10 +1,21 @@
 import type { NextFunction, Request, Response } from 'express';
-import { build402Response } from './payment-response';
+import {
+  build402Response,
+  resolveRpcUrl,
+  resolveUsdcMintAddress,
+} from './payment-response';
 import { recordTransaction } from './recorder';
-import type { AgentPaywallConfig } from './types';
+import {
+  createInMemoryReplayStore,
+  maybeWarnAboutMultiInstanceReplay,
+} from './replay-store';
+import type { AgentPaywallConfig, ReplayStore } from './types';
 import { verifyUSDCPayment } from './verify';
 
-const DEVNET_RPC_URL = 'https://api.devnet.solana.com';
+// Module-level so every middleware instance in this process shares the same
+// set of consumed signatures. Still process-local — supply config.replayStore
+// on multi-instance deployments.
+const defaultReplayStore: ReplayStore = createInMemoryReplayStore();
 
 type PaymentContext = {
   txSignature: string;
@@ -20,6 +31,9 @@ type RequestWithPayment = Request & {
  * Creates Express middleware that enforces USDC payment before allowing access to an API handler.
  */
 export function agentPaywall(config: AgentPaywallConfig) {
+  const replayStore = config.replayStore ?? defaultReplayStore;
+  if (!config.replayStore) maybeWarnAboutMultiInstanceReplay();
+
   return async (req: Request, res: Response, next: NextFunction) => {
     const paymentProofHeader = req.headers['x-payment-proof'];
     const paymentProof =
@@ -33,18 +47,45 @@ export function agentPaywall(config: AgentPaywallConfig) {
       return res.status(402).json(build402Response(config));
     }
 
+    // Atomic check-and-set inside the store. A signature is consumed the
+    // moment it is first seen, regardless of whether verification later
+    // succeeds or fails — never release it on failure, or an attacker can
+    // race a transient RPC failure to double-accept one valid payment.
+    if (
+      config.allowReplay !== true &&
+      (await replayStore.seen(paymentProof))
+    ) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        code: 'REPLAY_DETECTED',
+        message: 'Transaction signature has already been used',
+      });
+    }
+
     const result = await verifyUSDCPayment({
       txSignature: paymentProof,
       expectedRecipient: config.recipientWallet,
       expectedAmountUsdc: config.priceUsdc,
-      rpcUrl: config.rpcUrl ?? DEVNET_RPC_URL,
-      usdcMintAddress: config.usdcMintAddress,
+      rpcUrl: resolveRpcUrl(config),
+      usdcMintAddress: resolveUsdcMintAddress(config),
+      timeoutMs: config.verifyTimeout,
+      maxTxAgeSeconds: config.maxTxAgeSeconds,
+      onError: config.onError,
     });
 
     if (!result.valid) {
       return res.status(402).json({
         ...build402Response(config),
         verificationError: result.error,
+        verificationErrorCode: result.errorCode,
+      });
+    }
+
+    if (config.onPaymentVerified) {
+      config.onPaymentVerified({
+        signature: paymentProof,
+        amountUsdc: result.actualAmountUsdc ?? config.priceUsdc,
+        senderWallet: result.senderWallet,
       });
     }
 
