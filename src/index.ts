@@ -1,5 +1,6 @@
 export { agentPaywall } from './express';
 export { withAgentPaywall } from './nextjs';
+export { agentPaywallFastify } from './fastify';
 export { verifyUSDCPayment } from './verify';
 export { build402Response } from './payment-response';
 export { recordTransaction } from './recorder';
