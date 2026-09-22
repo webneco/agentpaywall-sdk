@@ -5,6 +5,17 @@ All notable changes to the @agentpaywall/sdk project will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-22
+
+### Fixed
+
+- `npm install` failed with a 404: removed the `@types/fastify` devDependency, which does not
+  exist on npm (Fastify ships its own types, and the SDK uses structural types for Fastify anyway)
+- Added `@solana/web3.js` as a devDependency so `type-check`, `build` and tests can run in a fresh
+  clone (it remains a peer dependency for consumers)
+- Fastify test suite crashed before running any tests because `beforeEach` was not imported from
+  `vitest`; all 11 Fastify tests now run and pass
+
 ## [0.3.0] - 2026-08-13
 
 ### Added

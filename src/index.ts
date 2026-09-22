@@ -14,4 +14,4 @@ export type {
 	VerifiedPayment,
 } from './types';
 
-export const version = '0.3.0';
+export const version = '0.3.1';
