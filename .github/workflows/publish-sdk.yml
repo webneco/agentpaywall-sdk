@@ -22,7 +22,7 @@ jobs:
           node-version: "22.14.0"
 
       - name: Use npm 11.20.0
-        run: corepack enable && corepack prepare npm@11.20.0 --activate
+        run: npm install -g npm@11.20.0
 
       - name: Install
         run: npm install
@@ -34,4 +34,4 @@ jobs:
         run: npm run build
 
       - name: Publish
-        run: npm publish --provenance --access public
+        run: npm --version && npm publish --provenance --access public
