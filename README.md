@@ -1,11 +1,15 @@
 # @agentpaywall/sdk
 
 [![npm version](https://img.shields.io/npm/v/@agentpaywall/sdk.svg)](https://www.npmjs.com/package/@agentpaywall/sdk)
+[![npm downloads](https://img.shields.io/npm/dm/@agentpaywall/sdk.svg)](https://www.npmjs.com/package/@agentpaywall/sdk)
+[![TypeScript](https://img.shields.io/badge/TypeScript-ready-blue.svg)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-Drop-in micropayment middleware for APIs, settled in **USDC on Solana**.
+**HTTP 402 Payment Required middleware for Node.js APIs** — drop-in pay-per-call micropayments, settled in **USDC on Solana**.
 
-Add two lines of code to any Express or Next.js API and start earning USDC per call - no billing system, no minimums, no chargebacks.
+Monetize any Express, Next.js or Fastify API in two lines of code and start earning USDC per request - no billing system, no minimums, no chargebacks. Built for **AI agents** and machine-to-machine payments: agents read the 402 JSON, pay on-chain, and retry automatically.
+
+**Keywords:** API monetization · pay-per-request API · HTTP 402 · USDC payments · Solana payments · stablecoin micropayments · AI agent payments · Express / Next.js / Fastify paywall middleware
 
 ## How it works
 
